@@ -1,5 +1,96 @@
 # Changes
 
+## Unreleased
+
+- Added `Reader.NetworksWithinPage`, a paginated counterpart to
+  `Reader.NetworksWithin`. It returns a `NetworksPage` of up to `pageSize`
+  results plus an opaque resume token; concatenating all pages reproduces the
+  full iterator sequence item by item. The existing `Networks` and
+  `NetworksWithin` iterators are unchanged in defaults, ordering, and boundary
+  behavior, and now share the same internal depth-first traversal engine
+  (`networkIterator`) as the paged API, so the two cannot drift apart.
+
+### Implementation choices
+
+- The traversal engine keeps the explicit pending-node stack of the previous
+  local DFS. Its key property is that the stack is fully determined by the
+  path from the traversal root to the next node to visit: every left turn
+  leaves the corresponding right sibling pending. A resume checkpoint is
+  therefore just a network-space position (IP address plus prefix length), and
+  resuming replays that path, re-reading child pointers from the tree in
+  O(depth) node reads. The token never contains search-tree node pointers or
+  data-section offsets, so it cannot leak internal pointer layout and remains
+  valid on a new `Reader` opened on the same database file.
+- The token is a versioned, fixed-size binary payload (version, metadata
+  fingerprint, options bitmask, normalized query prefix, resume position,
+  CRC-32) encoded as unpadded base64url. The metadata fingerprint (FNV-1a 64
+  over database type, binary format version, build epoch, IP version, node
+  count, and record size) binds the token to one database build; the
+  normalized prefix (IPv4 mapped into `::/96`, stop bit adjusted by 96) and
+  the options bitmask bind it to the exact traversal configuration. Every
+  mismatch returns an error wrapping the new sentinel
+  `ErrInvalidNetworksToken` with the specific reason (checksum, version,
+  different database, different prefix, different options) for diagnosis.
+- Paging contract: a page is either exactly `pageSize` long or final (empty
+  `ResumeToken`). An empty page always has an empty token, so a loop of the
+  form `for token != ""` cannot spin, and a page size larger than the total
+  yields one partial final page.
+
+### Coverage gaps closed
+
+- Previously nothing exercised traversal state after an early stop: the
+  iterator discarded its stack when the consumer broke out of the loop, and
+  there was no way to resume. The new tests page with sizes 1, 2, 7, and
+  larger than the total across the ipv4/ipv6/mixed test databases at all three
+  record sizes and across option combinations, asserting item-by-item
+  equality (prefix, found flag, offset, error) with the full iterator
+  (`TestNetworksWithinPageMatchesIterator`), resumption on a second `Reader`
+  instance (`TestNetworksWithinPageResumeOnNewReader`), and exact reproduction
+  of the pre-existing `NetworksWithin` expectation table
+  (`TestNetworksWithinPageExistingExpectations`).
+- Token validation had no error model at all; corrupt, truncated, stale
+  (different database, including same tree at a different record size),
+  prefix-mismatched, and option-mismatched tokens now each have a dedicated
+  failing assertion (`TestNetworksWithinPageTokenErrors`), and empty-page
+  termination and argument validation are pinned down
+  (`TestNetworksWithinPageEmptyPageTerminates`,
+  `TestNetworksWithinPageBoundaries`).
+
+### Adjacent-semantics regression protection
+
+- `NetworksWithin` was reimplemented on top of the shared engine; the existing
+  `TestNetworksWithin`, `TestNetworksWithInvalidSearchTree`,
+  `TestSkipEmptyValues*`, and GeoIP tests run unmodified against it, guarding
+  the old API's defaults, ordering, and fatal-error behavior (a structural
+  error is still the final yielded `Result`).
+- Visibility filters (IPv4 alias skipping, `IncludeNetworksWithoutData`,
+  `SkipEmptyValues`) are evaluated at pop time in both APIs, and the resume
+  checkpoint stores a tree position rather than a visible-result index, so
+  filters re-evaluate deterministically after a resume and cannot shift the
+  sequence across page boundaries.
+
+### Most dangerous counterexample and its regression test
+
+- The most dangerous case for MMDB tree traversal with a paginated cursor is
+  a page boundary that lands immediately before a run of filtered-out nodes
+  (IPv4 aliases such as `::ffff:0:0/96`, empty networks, or empty values under
+  `SkipEmptyValues`). If the resume token encoded the last *yielded* result
+  (or worse, a visible-result count) instead of the pending stack top, the
+  resume would either re-yield a duplicate or silently skip the first visible
+  network of the next page, and the corruption would only appear for specific
+  page sizes. The regression tests are
+  `TestNetworksWithinPageSkipEmptyValues` (a database with empty maps paged at
+  sizes 1, 2, 7, and total+13, where size 1 forces a resume after every single
+  result) and the `aliased`/`aliased+empty+skip` option sets of
+  `TestNetworksWithinPageMatchesIterator`, which cross alias boundaries at
+  every page size. For resume validation, the most dangerous case is a token
+  replayed against a database with the same prefix space but a different tree
+  shape (e.g., same tree at 24-bit vs 32-bit record size): the path replay
+  would read child pointers from the wrong nodes and could walk a wrong
+  subtree silently if the metadata fingerprint did not cover node count and
+  record size. This is pinned by the "same database with different record
+  size" subtest of `TestNetworksWithinPageTokenErrors`.
+
 ## 2.7.0
 
 - Go 1.26 or later is now required. CI now tests Go 1.26 and 1.27.
