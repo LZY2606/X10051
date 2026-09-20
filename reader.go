@@ -146,14 +146,15 @@ type mmapCleanup struct {
 // Close must not be called concurrently with other Reader or Result methods,
 // or with use of Reader-backed cursors or cursor-derived traversal handles.
 type Reader struct {
-	hasMappedFile     *atomic.Bool
-	decoder           decoder.ReflectionDecoder
-	buffer            []byte
-	Metadata          Metadata
-	ipv4Start         uint
-	nodeOffsetMult    uint
-	dataSectionSize   uint
-	ipv4StartBitDepth int
+	hasMappedFile       *atomic.Bool
+	decoder             decoder.ReflectionDecoder
+	buffer              []byte
+	Metadata            Metadata
+	metadataFingerprint [32]byte
+	ipv4Start           uint
+	nodeOffsetMult      uint
+	dataSectionSize     uint
+	ipv4StartBitDepth   int
 }
 
 // Metadata holds the metadata decoded from the MaxMind DB file.
@@ -357,6 +358,7 @@ func OpenBytes(buffer []byte, options ...ReaderOption) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	reader.metadataFingerprint = fingerprintMetadata(reader.Metadata)
 
 	// Check for integer overflow in search tree size calculation
 	if reader.Metadata.NodeCount > 0 && reader.Metadata.RecordSize > 0 {

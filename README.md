@@ -240,6 +240,39 @@ for result := range db.NetworksWithin(prefix) {
 }
 ```
 
+#### Paged iteration and resume cursors
+
+`NetworksPage` and `NetworksWithinPage` return a fixed-size page in the same
+deterministic order as the iterators, plus an opaque `NetworkCursor` that can
+be serialized to text, stored, and resumed later on a freshly opened
+`Reader`. A cursor is cryptographically bound to the database metadata, the
+prefix, and the iterator options; it never contains internal tree offsets.
+
+```go
+var cursor *maxminddb.NetworkCursor
+for {
+	page, err := db.NetworksWithinPage(cursor, prefix, 100)
+	if err != nil {
+		// errors.Is supports maxminddb.ErrCursorCorrupt,
+		// maxminddb.ErrCursorWrongDatabase,
+		// maxminddb.ErrCursorPrefixMismatch,
+		// maxminddb.ErrCursorOptionsMismatch, and maxminddb.ErrPageSize.
+		log.Fatal(err)
+	}
+	for _, result := range page.Results {
+		// ...
+	}
+	if page.Next == nil {
+		break
+	}
+	cursor = page.Next
+
+	// Persist and resume elsewhere:
+	token := cursor.String()
+	cursor, err = maxminddb.ParseNetworkCursor(token)
+}
+```
+
 ### Path-Based Decoding
 
 ```go

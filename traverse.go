@@ -1,13 +1,8 @@
 package maxminddb
 
 import (
-	"errors"
-	"fmt"
 	"iter"
 	"net/netip"
-	"runtime"
-
-	"github.com/oschwald/maxminddb-golang/v2/internal/mmdberrors"
 )
 
 // Internal structure used to keep track of nodes we still need to visit.
@@ -90,167 +85,17 @@ func (r *Reader) Networks(options ...NetworksOption) iter.Seq[Result] {
 // [IncludeNetworksWithoutData].
 func (r *Reader) NetworksWithin(prefix netip.Prefix, options ...NetworksOption) iter.Seq[Result] {
 	return func(yield func(Result) bool) {
-		if !prefix.IsValid() {
-			yield(Result{
-				err: errors.New("invalid prefix"),
-			})
-			return
-		}
-		if r.Metadata.IPVersion == 4 && prefix.Addr().Is6() {
-			yield(Result{
-				err: fmt.Errorf(
-					"error getting networks with '%s': you attempted to use an IPv6 network in an IPv4-only database",
-					prefix,
-				),
-			})
-			return
-		}
-
 		var n networkOptions
 		for _, option := range options {
 			option(&n)
 		}
 
-		ip := prefix.Addr()
-		netIP := ip
-		stopBit := prefix.Bits()
-		if ip.Is4() {
-			netIP = v4ToV16(ip)
-			stopBit += 96
-		}
-
-		if stopBit > 128 {
-			yield(Result{
-				err: errors.New("invalid prefix: exceeds IPv6 maximum of 128 bits"),
-			})
+		w := newNetworkWalker(r, n)
+		root, ok := w.prepareRoot(prefix, yield)
+		if !ok {
 			return
 		}
-
-		pointer, bit, err := r.traverseTree(ip, 0, stopBit)
-		if err != nil {
-			yield(Result{
-				ip:  ip,
-				err: err,
-			})
-			return
-		}
-
-		networkPrefix, err := netIP.Prefix(bit)
-		if err != nil {
-			yield(Result{
-				ip:        ip,
-				prefixLen: uint8(bit),
-				err:       fmt.Errorf("prefixing %s with %d: %w", netIP, bit, err),
-			})
-			return
-		}
-
-		nodes := make([]netNode, 0, 64)
-		nodes = append(nodes,
-			netNode{
-				ip:      networkPrefix.Addr(),
-				bit:     uint(bit),
-				pointer: pointer,
-			},
-		)
-
-		for len(nodes) > 0 {
-			node := nodes[len(nodes)-1]
-			nodes = nodes[:len(nodes)-1]
-
-			for {
-				if node.pointer == r.Metadata.NodeCount {
-					if n.includeEmptyNetworks {
-						ok := yield(Result{
-							ip:        mappedIP(node.ip),
-							offset:    notFound,
-							prefixLen: uint8(node.bit),
-						})
-						if !ok {
-							return
-						}
-					}
-					break
-				}
-				// This skips IPv4 aliases without hardcoding the networks that the writer
-				// currently aliases.
-				if !n.includeAliasedNetworks && r.ipv4Start != 0 &&
-					node.pointer == r.ipv4Start && !isInIPv4Subtree(node.ip) {
-					break
-				}
-
-				if node.pointer > r.Metadata.NodeCount {
-					offset, err := r.resolveDataPointer(node.pointer)
-
-					// Check if we should skip empty values (only if no error)
-					if err == nil && n.skipEmptyValues {
-						var isEmpty bool
-						isEmpty, err = r.decoder.IsEmptyValueAt(uint(offset))
-						if err == nil && isEmpty {
-							// Skip this empty value
-							break
-						}
-					}
-
-					ok := yield(Result{
-						reader:    r,
-						ip:        mappedIP(node.ip),
-						offset:    uint(offset),
-						prefixLen: uint8(node.bit),
-						err:       err,
-					})
-					if !ok {
-						return
-					}
-					break
-				}
-				ipRight := node.ip.As16()
-				if len(ipRight) <= int(node.bit>>3) {
-					displayAddr := node.ip
-					if isInIPv4Subtree(node.ip) {
-						displayAddr = v6ToV4(displayAddr)
-					}
-
-					res := Result{
-						ip:        displayAddr,
-						prefixLen: uint8(node.bit),
-					}
-					res.err = mmdberrors.NewInvalidDatabaseError(
-						"invalid search tree at %s", res.Prefix(),
-					)
-
-					yield(res)
-
-					return
-				}
-				ipRight[node.bit>>3] |= 1 << (7 - (node.bit % 8))
-
-				baseOffset := node.pointer * r.nodeOffsetMult
-				leftPointer, rightPointer, err := readNodePairBySize(
-					r.buffer,
-					baseOffset,
-					r.Metadata.RecordSize,
-				)
-				if err != nil {
-					yield(Result{
-						ip:        mappedIP(node.ip),
-						prefixLen: uint8(node.bit),
-						err:       err,
-					})
-					return
-				}
-
-				node.bit++
-				nodes = append(nodes, netNode{
-					pointer: rightPointer,
-					ip:      netip.AddrFrom16(ipRight),
-					bit:     node.bit,
-				})
-
-				node.pointer = leftPointer
-			}
-		}
-		runtime.KeepAlive(r)
+		w.run([]netNode{root}, 0, yield)
 	}
 }
 

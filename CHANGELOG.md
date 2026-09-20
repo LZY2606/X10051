@@ -1,5 +1,97 @@
 # Changes
 
+## Unreleased
+
+- Added deterministic, resumable pagination for network traversal:
+  `(*Reader).NetworksPage` and `(*Reader).NetworksWithinPage`, together with
+  the opaque `NetworkCursor` type and `ParseNetworkCursor`. A page returns up
+  to the requested number of networks in exactly the order that `Networks`
+  and `NetworksWithin` use; the cursor in `NetworkPage.Next` resumes the
+  traversal on any `Reader` opened for the same database, including a fresh
+  process. The cursor implements `encoding.TextMarshaler` and
+  `encoding.TextUnmarshaler`.
+- Cursor tokens carry no search-tree pointers or data-section offsets. A
+  continuation is described solely by the network paths (address bit
+  prefixes) of the pending DFS frames; resumption re-walks those paths from
+  the root to rebuild the internal frame stack. Each token is HMAC-SHA256
+  authenticated and bound to a SHA-256 fingerprint of the database metadata,
+  to the requested prefix, and to the set of iterator options
+  (`IncludeAliasedNetworks`, `IncludeNetworksWithoutData`,
+  `SkipEmptyValues`).
+- New sentinel errors support programmatic diagnosis: `ErrPageSize`,
+  `ErrCursorCorrupt` (malformed or tampered token),
+  `ErrCursorWrongDatabase` (metadata fingerprint mismatch, e.g. a stale
+  cursor replayed after a database update), `ErrCursorPrefixMismatch`, and
+  `ErrCursorOptionsMismatch`. All are wrapped with diagnostic context
+  (database type, build epoch, node/record counts, and the conflicting
+  prefix or option bits) and match `errors.Is`.
+- Empty pages do not loop: the page size counts emitted networks rather than
+  visited nodes, so options such as `SkipEmptyValues` filter inside the walk
+  and a page is empty only when the traversal is exhausted (`Next == nil`);
+  every non-terminal page is full. `pageSize` must be greater than zero.
+
+### Implementation notes
+
+- The `NetworksWithin` DFS was extracted into an internal `networkWalker`
+  shared by the iterator and paging entry points; a bounded variant returns
+  its continuation stack when the page limit is reached. A leaf emitted as
+  the last item of a page is deliberately not re-pushed, which prevents the
+  last network of one page from being emitted again on resume.
+- Metadata is fingerprinted once at `OpenBytes` time over database type,
+  build epoch, IP version, node count, record size, format versions, sorted
+  descriptions, and sorted languages. Two database files with byte-identical
+  metadata cannot be distinguished by a cursor; this is acceptable because a
+  cursor only grants continuation of an address-path traversal and frame
+  reconstruction verifies the rebuilt pointer depth against the token.
+- The frame-stack token length is bounded (at most 128 frames, one per tree
+  depth) and validated strictly on parse: version, family, prefix length,
+  masked prefix/frame addresses, option-bit mask, frame depth (1..128), and
+  exact payload length are all checked before the HMAC is compared.
+
+### Coverage gaps previously left open
+
+- There was no way to consume a bounded prefix of `NetworksWithin` and
+  restart deterministically: early `break`/`range` termination discarded the
+  walker's local DFS stack, so callers could only resume by re-scanning from
+  the root and skipping already-seen prefixes (quadratic worst case, and
+  dependent on client-side prefix bookkeeping).
+- No test pinned traversal order across every record size (24/28/32) under
+  paging boundaries, and nothing covered resumption across the IPv4 alias
+  boundary, empty-network leaves at a page edge, or
+  `SkipEmptyValues`-filtered regions. Cursor tampering, stale metadata, and
+  prefix/option rebinding had no failure model.
+
+### Adjacent-semantics regression protection
+
+- `Networks` and `NetworksWithin` signatures, defaults, ordering, error
+  texts, and boundary behavior are unchanged; both now delegate to the same
+  walker used by paging. Existing traversal tests (including
+  `TestNetworks`, `TestNetworksWithin`, `TestGeoIPNetworksWithin`,
+  `TestSkipEmptyValues`, and the broken-search-tree test) continue to pass
+  unchanged.
+- Paging tests stitch pages at sizes 1, 2, 7, exact-total, and
+  larger-than-total and assert item-for-item equality (including empty
+  networks via the `#empty` key and data offsets) with the plain iterator on
+  IPv4, IPv6, and mixed databases at every record size.
+
+### Most dangerous counterexample and its regression test
+
+- The single most dangerous case is the mixed (IPv6) database's IPv4 aliasing
+  combined with a page boundary. In an IPv6 MMDB, the IPv4 subtree is reached
+  both from `::/96` (displayed as IPv4) and through writer aliases such as
+  `::ffff:0:0/96`, `2001::/32`, and `2002::/16`; frames for these aliases
+  point at the same node as the IPv4 subtree root. A naive continuation that
+  serializes raw node pointers, or that does not re-evaluate the alias rule
+  after rebuilding a frame, either leaks internal offsets and becomes
+  invalid after a rebuild (mmap relocation/database update) or emits the
+  IPv4 networks zero or twice depending on whether `IncludeAliasedNetworks`
+  was set. `TestPagingIPv4AliasResume` pages the mixed database at size 1
+  with aliases both excluded and included and asserts the concatenated output
+  equals the iterator exactly; `TestPagingResumeOnFreshReader` additionally
+  closes and reopens the `Reader` on every page boundary; and
+  `TestPagingCursorTokenIsOpaqueAndStable` asserts the token never contains
+  data offsets and is deterministic for an identical position.
+
 ## 2.7.0
 
 - Go 1.26 or later is now required. CI now tests Go 1.26 and 1.27.

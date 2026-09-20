@@ -172,6 +172,54 @@ func ExampleReader_NetworksWithin() {
 	// 1.0.128.0/17: Cable/DSL
 }
 
+// This example demonstrates deterministic, resumable paging over the
+// networks within a prefix. The opaque cursor token may be persisted and
+// resumed on a newly opened Reader, possibly in another process.
+func ExampleReader_NetworksWithinPage() {
+	db, err := maxminddb.Open("testdata/test-data/GeoIP2-Connection-Type-Test.mmdb")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	prefix, err := netip.ParsePrefix("1.0.0.0/8")
+	if err != nil {
+		log.Panic(err)
+	}
+
+	var cursor *maxminddb.NetworkCursor
+	for {
+		page, err := db.NetworksWithinPage(cursor, prefix, 4)
+		if err != nil {
+			log.Panic(err)
+		}
+		for _, result := range page.Results {
+			record := struct {
+				ConnectionType string `maxminddb:"connection_type"`
+			}{}
+			if err := result.Decode(&record); err != nil {
+				log.Panic(err)
+			}
+			fmt.Printf("%s: %s\n", result.Prefix(), record.ConnectionType)
+		}
+		if page.Next == nil {
+			break
+		}
+		cursor = page.Next
+	}
+
+	// Output:
+	// 1.0.0.0/24: Cable/DSL
+	// 1.0.1.0/24: Cellular
+	// 1.0.2.0/23: Cable/DSL
+	// 1.0.4.0/22: Cable/DSL
+	// 1.0.8.0/21: Cable/DSL
+	// 1.0.16.0/20: Cable/DSL
+	// 1.0.32.0/19: Cable/DSL
+	// 1.0.64.0/18: Cable/DSL
+	// 1.0.128.0/17: Cable/DSL
+}
+
 // This example demonstrates how to use SkipEmptyValues to iterate only over
 // networks that have actual data, skipping those with empty maps or arrays.
 func ExampleSkipEmptyValues() {
